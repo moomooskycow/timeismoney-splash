@@ -1,0 +1,19 @@
+# Files that must never be uploaded as public assets.
+# The public surface is the released static site only: index.html,
+# favicon.ico, css/, js/, fonts/, images/. The DigitalOcean origin serves
+# the same set from /opt/public-apps/timeismoney/current.
+README.md
+CLAUDE.md
+BACKLOG.md
+Dockerfile
+server.js
+api/
+scripts/
+.github/
+.gitignore
+.git/
+.wrangler/
+.mcp.json
+.npmrc
+wrangler.jsonc
+.assetsignore
