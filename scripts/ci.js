@@ -15,9 +15,11 @@ const REQUIRED_FILES = [
   'api/health.js',
   'api/canary/api/v1/errors.js',
   'server.js',
+  'worker.mjs',
   'Dockerfile',
   'scripts/verify-canary.js',
   'scripts/verify-server.js',
+  'scripts/verify-worker.js',
   'scripts/smoke-canary-production.js',
   'favicon.ico',
   'fonts/ClashDisplay-Variable.woff2',
@@ -57,7 +59,10 @@ function listJavaScriptFiles(dir = ROOT) {
         if (entry.name === '.git' || entry.name === 'node_modules') return [];
         return listJavaScriptFiles(absolutePath);
       }
-      if (!entry.isFile() || !entry.name.endsWith('.js')) return [];
+      if (!entry.isFile()) return [];
+      if (!entry.name.endsWith('.js') && !entry.name.endsWith('.mjs')) {
+        return [];
+      }
       return [path.relative(ROOT, absolutePath).split(path.sep).join(path.posix.sep)];
     })
     .sort();
@@ -182,6 +187,9 @@ function main() {
   step('Canary routes preserve behavior', () => runNodeScript('scripts/verify-canary.js'));
   step('DigitalOcean server adapter preserves behavior', () =>
     runNodeScript('scripts/verify-server.js')
+  );
+  step('Cloudflare Worker adapter preserves behavior', () =>
+    runNodeScript('scripts/verify-worker.js')
   );
   console.log('timeismoney-splash CI gate passed');
 }
