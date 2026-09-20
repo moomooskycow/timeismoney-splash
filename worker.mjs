@@ -67,17 +67,70 @@ class ResponseAdapter {
 
 /**
  * Adapts a Fetch API Request into the Node request shape the api handlers
- * read: method, url (path + query), a lowercase header map, and a pre-read
- * body string. The handlers prefer `req.body` when present, so the body is
- * never read twice.
+ * read: method, url (path + query), a lowercase header map, and a Node-style
+ * body event interface backed by the request stream. The handlers' own
+ * readBody() enforces MAX_BODY_BYTES while streaming, so the cap and the 413
+ * semantics stay in one place (api/canary/api/v1/errors.js) and cannot drift
+ * between the Worker and the sidecar.
  */
-function adaptRequest(request, bodyText) {
+function adaptRequest(request) {
   const url = new URL(request.url);
   return {
     method: request.method,
     url: url.pathname + url.search,
     headers: Object.fromEntries(request.headers),
-    body: bodyText,
+    ...bodyEventInterface(request.body),
+  };
+}
+
+/**
+ * Minimal 'data' / 'end' / 'error' emitter over a ReadableStream, matching
+ * the Node request interface readBody() consumes. The stream is pumped only
+ * after the handler attaches its listeners, and destroy() cancels the read
+ * when the handler rejects an oversized payload.
+ */
+function bodyEventInterface(stream) {
+  const listeners = new Map();
+  let reader = null;
+  let pumping = false;
+  let destroyed = false;
+
+  function emit(event, argument) {
+    for (const listener of listeners.get(event) || []) listener(argument);
+  }
+
+  async function pump() {
+    if (pumping) return;
+    pumping = true;
+    if (!stream) {
+      emit('end');
+      return;
+    }
+    reader = stream.getReader();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (destroyed) return;
+        if (done) break;
+        emit('data', new TextDecoder().decode(value));
+      }
+      emit('end');
+    } catch (error) {
+      emit('error', error);
+    }
+  }
+
+  return {
+    on(event, listener) {
+      if (!listeners.has(event)) listeners.set(event, []);
+      listeners.get(event).push(listener);
+      queueMicrotask(pump);
+      return this;
+    },
+    destroy() {
+      destroyed = true;
+      if (reader) reader.cancel().catch(() => {});
+    },
   };
 }
 
@@ -93,13 +146,8 @@ async function handleApiRequest(request) {
   const handler = API_ROUTES.get(pathname);
   if (!handler) return jsonError(404, { error: 'Not found' });
 
-  const bodyText =
-    request.method === 'GET' || request.method === 'HEAD'
-      ? undefined
-      : await request.text();
-
   const response = new ResponseAdapter();
-  await handler(adaptRequest(request, bodyText), response);
+  await handler(adaptRequest(request), response);
   return response.toResponse();
 }
 

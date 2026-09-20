@@ -184,6 +184,41 @@ async function main() {
       assert.equal(response.status, attempt <= 30 ? 202 : 429);
     }
 
+    // --- relay: oversized bodies are rejected while streaming (no full buffer) ---
+    forwarded = undefined;
+    response = await worker.fetch(
+      relayRequest('www.timeismoney.works', 'https://www.timeismoney.works', {
+        message: 'x'.repeat(40000),
+      }),
+      env
+    );
+    assert.equal(response.status, 413);
+    assert.equal(forwarded, undefined);
+
+    const streamed = new ReadableStream({
+      start(controller) {
+        const encoder = new TextEncoder();
+        controller.enqueue(encoder.encode('{"message":"' + 'a'.repeat(20000)));
+        controller.enqueue(encoder.encode('b'.repeat(20000) + '"}'));
+        controller.close();
+      },
+    });
+    response = await worker.fetch(
+      new Request('https://www.timeismoney.works/api/canary/api/v1/errors', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Host: 'www.timeismoney.works',
+          Origin: 'https://www.timeismoney.works',
+        },
+        body: streamed,
+        duplex: 'half',
+      }),
+      env
+    );
+    assert.equal(response.status, 413);
+    assert.equal(forwarded, undefined);
+
     // --- unknown /api paths are worker-owned 404s, never asset lookups ---
     response = await worker.fetch(
       new Request('https://www.timeismoney.works/api/does-not-exist'),

@@ -64,6 +64,9 @@ serves every other path from the static assets (`wrangler.jsonc` +
 `.assetsignore`). Deploy with `wrangler deploy --env staging` first, then
 `wrangler deploy --env production`; production attaches the custom domains
 (`timeismoney.mistystep.io`, `timeismoney.works`, `www.timeismoney.works`).
+The registrar nameserver flip is separate and operator-gated: until it
+completes, `timeismoney.works` and `www.timeismoney.works` keep serving from
+the DigitalOcean Caddy origin and redirect to `timeismoney.mistystep.io`.
 
 The Worker defines:
 
