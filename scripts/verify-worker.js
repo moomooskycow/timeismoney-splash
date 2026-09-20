@@ -236,6 +236,68 @@ async function main() {
       assert.equal(response.status, attempt <= 30 ? 202 : 429);
     }
 
+    // --- relay: the streaming cap counts raw bytes, not UTF-16 code units ---
+    forwarded = undefined;
+    const cjkStream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(
+          new TextEncoder().encode('{"message":"' + '中'.repeat(15000) + '"}')
+        );
+        controller.close();
+      },
+    });
+    response = await worker.fetch(
+      new Request('https://www.timeismoney.works/api/canary/api/v1/errors', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Host: 'www.timeismoney.works',
+          Origin: 'https://www.timeismoney.works',
+        },
+        body: cjkStream,
+        duplex: 'half',
+      }),
+      env
+    );
+    assert.equal(response.status, 413);
+    assert.equal(forwarded, undefined);
+
+    // --- relay: a multibyte character split across chunks survives intact ---
+    forwarded = undefined;
+    const encoder = new TextEncoder();
+    const prefix = encoder.encode('{"message":"ok ');
+    const bomb = encoder.encode('💥');
+    const suffix = encoder.encode(' done"}');
+    const firstHalf = new Uint8Array(prefix.length + 2);
+    firstHalf.set(prefix);
+    firstHalf.set(bomb.slice(0, 2), prefix.length);
+    const secondHalf = new Uint8Array(bomb.length - 2 + suffix.length);
+    secondHalf.set(bomb.slice(2));
+    secondHalf.set(suffix, bomb.length - 2);
+    const splitStream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(firstHalf);
+        controller.enqueue(secondHalf);
+        controller.close();
+      },
+    });
+    response = await worker.fetch(
+      new Request('https://www.timeismoney.works/api/canary/api/v1/errors', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Host: 'www.timeismoney.works',
+          Origin: 'https://www.timeismoney.works',
+        },
+        body: splitStream,
+        duplex: 'half',
+      }),
+      env
+    );
+    assert.equal(response.status, 202);
+    assert.equal(forwarded.body.message.includes('💥'), true);
+    assert.equal(forwarded.body.message.includes('\uFFFD'), false);
+
     // --- unknown /api paths are worker-owned 404s, never asset lookups ---
     response = await worker.fetch(
       new Request('https://www.timeismoney.works/api/does-not-exist'),

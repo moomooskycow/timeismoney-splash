@@ -24,6 +24,10 @@ const API_ROUTES = new Map([
   ['/api/canary/api/v1/errors', relay],
 ]);
 
+// Shared with the handler so the Worker's streaming byte cap cannot drift
+// from the relay's advertised 32 KiB limit.
+const MAX_BODY_BYTES = Number(relay.MAX_BODY_BYTES) || 32768;
+
 /** Adapts the api handlers' setHeader/status/json/end contract onto Response. */
 class ResponseAdapter {
   constructor() {
@@ -119,13 +123,24 @@ function bodyEventInterface(stream) {
       return;
     }
     reader = stream.getReader();
+    const decoder = new TextDecoder();
+    let received = 0;
     try {
       for (;;) {
         const { done, value } = await reader.read();
         if (destroyed) return;
         if (done) break;
-        emit('data', new TextDecoder().decode(value));
+        received += value.byteLength;
+        if (received > MAX_BODY_BYTES) {
+          emit('error', new Error('payload_too_large'));
+          destroyed = true;
+          await reader.cancel().catch(() => {});
+          return;
+        }
+        emit('data', decoder.decode(value, { stream: true }));
       }
+      const tail = decoder.decode();
+      if (tail) emit('data', tail);
       emit('end');
     } catch (error) {
       emit('error', error);
