@@ -75,10 +75,22 @@ class ResponseAdapter {
  */
 function adaptRequest(request) {
   const url = new URL(request.url);
+  const headers = Object.fromEntries(request.headers);
+  // DigitalOcean's platform injects do-connecting-ip on the sidecar; at
+  // Cloudflare ingress that header is client-supplied and spoofable, so
+  // replace it with the platform's own client address (and drop it when
+  // the platform header is absent) to keep the relay rate-limit key
+  // deterministic (Codex P2).
+  const clientIp = request.headers.get('cf-connecting-ip');
+  if (clientIp) {
+    headers['do-connecting-ip'] = clientIp;
+  } else {
+    delete headers['do-connecting-ip'];
+  }
   return {
     method: request.method,
     url: url.pathname + url.search,
-    headers: Object.fromEntries(request.headers),
+    headers,
     ...bodyEventInterface(request.body),
   };
 }

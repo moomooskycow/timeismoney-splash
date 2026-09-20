@@ -219,6 +219,23 @@ async function main() {
     assert.equal(response.status, 413);
     assert.equal(forwarded, undefined);
 
+    // --- relay: a spoofed do-connecting-ip cannot rotate the rate-limit key ---
+    for (let attempt = 1; attempt <= 31; attempt += 1) {
+      response = await worker.fetch(
+        relayRequest(
+          'www.timeismoney.works',
+          'https://www.timeismoney.works',
+          { message: `spoofed client ip ${attempt}` },
+          {
+            'CF-Connecting-IP': '203.0.113.9',
+            'DO-Connecting-IP': `198.51.100.${attempt}`,
+          }
+        ),
+        env
+      );
+      assert.equal(response.status, attempt <= 30 ? 202 : 429);
+    }
+
     // --- unknown /api paths are worker-owned 404s, never asset lookups ---
     response = await worker.fetch(
       new Request('https://www.timeismoney.works/api/does-not-exist'),
