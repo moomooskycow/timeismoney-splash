@@ -11,19 +11,26 @@ const REQUIRED_FILES = [
   'index.html',
   'css/styles.css',
   'js/app.js',
-  'js/canary.js',
+  'js/sentry.js',
   'api/health.js',
+  'api/sentry-config.js',
   'api/canary/api/v1/errors.js',
   'server.js',
   'worker.mjs',
   'Dockerfile',
-  'scripts/verify-canary.js',
+  'scripts/verify-retirement.js',
+  'scripts/verify-browser.js',
   'scripts/verify-server.js',
   'scripts/verify-worker.js',
-  'scripts/smoke-canary-production.js',
   'favicon.ico',
   'fonts/ClashDisplay-Variable.woff2',
   'images/icon_640.png',
+];
+
+const RETIRED_CANARY_FILES = [
+  'js/canary.js',
+  'scripts/smoke-canary-production.js',
+  'scripts/verify-canary.js',
 ];
 
 const FORBIDDEN_DEPENDENCY_FILES = [
@@ -110,6 +117,84 @@ function assertNoDependencyBuildStep() {
   }
 }
 
+function assertProviderRetirement() {
+  for (const retiredPath of ['vercel.json', '.vercelignore']) {
+    if (fs.existsSync(rootPath(retiredPath))) {
+      throw new Error(`retired provider file remains: ${retiredPath}`);
+    }
+  }
+
+  for (const relativePath of [
+    'CLAUDE.md',
+    'README.md',
+    'api/health.js',
+    'api/canary/api/v1/errors.js',
+  ]) {
+    const source = readText(relativePath);
+    if (/\bVercel\b|VERCEL_|x-vercel-/i.test(source)) {
+      throw new Error(`retired provider marker remains: ${relativePath}`);
+    }
+  }
+}
+
+function assertCanaryRetired() {
+  RETIRED_CANARY_FILES.forEach((relativePath) => {
+    if (fs.existsSync(rootPath(relativePath))) {
+      throw new Error(`retired canary file must not return: ${relativePath}`);
+    }
+  });
+
+  const forbidden = [
+    /canary\.mistystep\.io/i,
+    /CANARY_API_KEY/,
+    /CANARY_ENDPOINT/,
+    /CANARY_SERVICE_NAME/,
+    /CANARY_ENVIRONMENT/,
+    /CANARY_READ/,
+    /forwardToCanary/,
+  ];
+  for (const relativePath of [
+    'index.html',
+    'js/sentry.js',
+    'api/health.js',
+    'api/sentry-config.js',
+    'api/canary/api/v1/errors.js',
+    'server.js',
+    'worker.mjs',
+    'wrangler.jsonc',
+    'README.md',
+    'CLAUDE.md',
+  ]) {
+    const source = readText(relativePath);
+    for (const pattern of forbidden) {
+      if (pattern.test(source)) {
+        throw new Error(`retired canary wiring remains in ${relativePath}: ${pattern}`);
+      }
+    }
+  }
+
+  const tombstone = readText('api/canary/api/v1/errors.js');
+  if (/fetch\s*\(/.test(tombstone)) {
+    throw new Error('the canary tombstone must not forward');
+  }
+  if (/JSON\.parse|readBody|MAX_BODY_BYTES/.test(tombstone)) {
+    throw new Error('the canary tombstone must not parse or buffer bodies');
+  }
+}
+
+function assertWorkerSourceIsNotAnAsset() {
+  const ignored = readText('.assetsignore')
+    .split(/\r?\n/)
+    .map((line) => line.trim());
+  for (const required of ['api/', 'scripts/', 'worker.mjs', 'node_modules/', '.dev.vars*', '.env*']) {
+    if (!ignored.includes(required)) {
+      throw new Error(
+        `.assetsignore must exclude ${required} from the asset upload`
+      );
+    }
+  }
+}
+
 function assertHtmlReferences() {
   const html = readText('index.html');
   const ids = new Set();
@@ -181,16 +266,24 @@ function step(name, fn) {
 function main() {
   step('required static files exist', () => REQUIRED_FILES.forEach(requireFile));
   step('zero-dependency static-site contract is intact', assertNoDependencyBuildStep);
+  step('retired provider cannot be recreated', assertProviderRetirement);
+  step('retired canary wiring cannot return', assertCanaryRetired);
   step('index.html local references resolve', assertHtmlReferences);
   step('CSS local references resolve', assertCssReferences);
   step('JavaScript parses', assertJavaScriptSyntax);
-  step('Canary routes preserve behavior', () => runNodeScript('scripts/verify-canary.js'));
+  step('liveness and retirement contracts hold', () =>
+    runNodeScript('scripts/verify-retirement.js')
+  );
+  step('browser bootstrap honors injectable config', () =>
+    runNodeScript('scripts/verify-browser.js')
+  );
   step('DigitalOcean server adapter preserves behavior', () =>
     runNodeScript('scripts/verify-server.js')
   );
-  step('Cloudflare Worker adapter preserves behavior', () =>
+  step('Worker entrypoint preserves behavior', () =>
     runNodeScript('scripts/verify-worker.js')
   );
+  step('worker sources stay out of the asset store', assertWorkerSourceIsNotAnAsset);
   console.log('timeismoney-splash CI gate passed');
 }
 

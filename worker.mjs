@@ -1,44 +1,66 @@
-/* global Request, Response, Headers, URL, console */
+/* global console, Headers, Request, Response, URL */
+
 import health from './api/health.js';
-import relay from './api/canary/api/v1/errors.js';
+import sentryConfig from './api/sentry-config.js';
+import canaryTombstone from './api/canary/api/v1/errors.js';
 
 /**
- * Cloudflare Worker entrypoint for the Time is Money splash.
+ * Cloudflare Worker entry for the Time is Money splash.
  *
- * server.js (the DigitalOcean sidecar adapter) owns the routing contract;
- * this worker mirrors it for the Workers runtime so every host serves the
- * same surface:
+ * `server.js` owns the routing contract for the dependency-free Node
+ * sidecar; this worker mirrors it for the Workers runtime so every hostname
+ * that serves the site (timeismoney.mistystep.io today; timeismoney.works
+ * and www.timeismoney.works after the registrar flip) serves the same
+ * routes:
  *
- *   - GET/HEAD /api/health               -> api/health.js
- *   - POST     /api/canary/api/v1/errors -> api/canary/api/v1/errors.js
- *   - any other path                     -> static assets via ASSETS binding
+ *   - GET|HEAD /api/health                -> api/health.js
+ *   - GET|HEAD /api/sentry-config         -> api/sentry-config.js
+ *   - any      /api/canary/api/v1/errors  -> api/canary/api/v1/errors.js
+ *                                            (410 tombstone; no body read)
  *
- * wrangler.jsonc runs this worker first for /api/* only; every other path is
- * served straight from static assets. The entry is ESM (.mjs) so Node can
- * parse and test it without a package.json: the repo is zero-dependency by
- * contract (see scripts/ci.js).
+ * Static assets keep being served by the assets layer; only /api/*
+ * requests and non-asset paths reach this script (see `assets` in
+ * wrangler.jsonc). Non-API paths 404 exactly like the assets-only
+ * deployment did. `src/` is kept out of the asset store by .assetsignore.
+ *
+ * The api/ handlers read configuration from process.env (nodejs_compat),
+ * with the same names as the sidecar: SENTRY_DSN, SENTRY_ENVIRONMENT,
+ * SENTRY_RELEASE, NODE_ENV.
  */
 
-const API_ROUTES = new Map([
-  ['/api/health', health],
-  ['/api/canary/api/v1/errors', relay],
-]);
+function jsonResponse(payload, status) {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: { 'Content-Type': 'application/json; charset=utf-8' },
+  });
+}
 
-// Shared with the handler so the Worker's streaming byte cap cannot drift
-// from the relay's advertised 32 KiB limit.
-const MAX_BODY_BYTES = Number(relay.MAX_BODY_BYTES) || 32768;
+/** Adapts a Fetch API request to the req shape the api/ handlers expect. */
+function nodeRequest(request) {
+  const url = new URL(request.url);
+  const headers = {};
+  for (const [name, value] of request.headers) {
+    headers[name.toLowerCase()] = value;
+  }
+  if (!headers.host) headers.host = url.host;
+  return {
+    method: request.method,
+    url: `${url.pathname}${url.search}`,
+    headers,
+    body: undefined,
+  };
+}
 
-/** Adapts the api handlers' setHeader/status/json/end contract onto Response. */
-class ResponseAdapter {
+/** Adapts the api/ handlers' setHeader/status/json contract onto Response. */
+class NodeResponse {
   constructor() {
     this.headers = new Headers();
     this.statusCode = 200;
     this.payload = undefined;
-    this.ended = false;
   }
 
   setHeader(name, value) {
-    this.headers.set(name, value);
+    this.headers.set(name, String(value));
     return this;
   }
 
@@ -48,154 +70,74 @@ class ResponseAdapter {
   }
 
   json(payload) {
-    if (!this.headers.has('Content-Type')) {
-      this.headers.set('Content-Type', 'application/json; charset=utf-8');
-    }
     this.payload = payload;
-    this.ended = true;
     return this;
   }
 
   end() {
-    this.ended = true;
     return this;
   }
 
   toResponse() {
-    return new Response(
-      this.payload === undefined ? null : JSON.stringify(this.payload),
-      { status: this.statusCode, headers: this.headers }
-    );
-  }
-}
-
-/**
- * Adapts a Fetch API Request into the Node request shape the api handlers
- * read: method, url (path + query), a lowercase header map, and a Node-style
- * body event interface backed by the request stream. The handlers' own
- * readBody() enforces MAX_BODY_BYTES while streaming, so the cap and the 413
- * semantics stay in one place (api/canary/api/v1/errors.js) and cannot drift
- * between the Worker and the sidecar.
- */
-function adaptRequest(request) {
-  const url = new URL(request.url);
-  const headers = Object.fromEntries(request.headers);
-  // DigitalOcean's platform injects do-connecting-ip on the sidecar; at
-  // Cloudflare ingress that header is client-supplied and spoofable, so
-  // replace it with the platform's own client address (and drop it when
-  // the platform header is absent) to keep the relay rate-limit key
-  // deterministic (Codex P2).
-  const clientIp = request.headers.get('cf-connecting-ip');
-  if (clientIp) {
-    headers['do-connecting-ip'] = clientIp;
-  } else {
-    delete headers['do-connecting-ip'];
-  }
-  return {
-    method: request.method,
-    url: url.pathname + url.search,
-    headers,
-    ...bodyEventInterface(request.body),
-  };
-}
-
-/**
- * Minimal 'data' / 'end' / 'error' emitter over a ReadableStream, matching
- * the Node request interface readBody() consumes. The stream is pumped only
- * after the handler attaches its listeners, and destroy() cancels the read
- * when the handler rejects an oversized payload.
- */
-function bodyEventInterface(stream) {
-  const listeners = new Map();
-  let reader = null;
-  let pumping = false;
-  let destroyed = false;
-
-  function emit(event, argument) {
-    for (const listener of listeners.get(event) || []) listener(argument);
-  }
-
-  async function pump() {
-    if (pumping) return;
-    pumping = true;
-    if (!stream) {
-      emit('end');
-      return;
+    if (this.payload === undefined) {
+      return new Response(null, {
+        status: this.statusCode,
+        headers: this.headers,
+      });
     }
-    reader = stream.getReader();
-    const decoder = new TextDecoder();
-    let received = 0;
-    try {
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (destroyed) return;
-        if (done) break;
-        received += value.byteLength;
-        if (received > MAX_BODY_BYTES) {
-          emit('error', new Error('payload_too_large'));
-          destroyed = true;
-          await reader.cancel().catch(() => {});
-          return;
-        }
-        emit('data', decoder.decode(value, { stream: true }));
-      }
-      const tail = decoder.decode();
-      if (tail) emit('data', tail);
-      emit('end');
-    } catch (error) {
-      emit('error', error);
+    if (!this.headers.has('Content-Type')) {
+      this.headers.set('Content-Type', 'application/json; charset=utf-8');
     }
+    return new Response(JSON.stringify(this.payload), {
+      status: this.statusCode,
+      headers: this.headers,
+    });
   }
-
-  return {
-    on(event, listener) {
-      if (!listeners.has(event)) listeners.set(event, []);
-      listeners.get(event).push(listener);
-      queueMicrotask(pump);
-      return this;
-    },
-    destroy() {
-      destroyed = true;
-      if (reader) reader.cancel().catch(() => {});
-    },
-  };
 }
 
-function jsonError(status, payload) {
-  return new Response(JSON.stringify(payload), {
-    status,
-    headers: { 'Content-Type': 'application/json; charset=utf-8' },
-  });
-}
-
-async function handleApiRequest(request) {
+async function handle(request) {
   const { pathname } = new URL(request.url);
-  const handler = API_ROUTES.get(pathname);
-  if (!handler) return jsonError(404, { error: 'Not found' });
 
-  const response = new ResponseAdapter();
-  await handler(adaptRequest(request), response);
-  return response.toResponse();
+  if (pathname === '/api/health') {
+    const response = new NodeResponse();
+    await health(nodeRequest(request), response);
+    return response.toResponse();
+  }
+
+  if (pathname === '/api/sentry-config') {
+    const response = new NodeResponse();
+    await sentryConfig(nodeRequest(request), response);
+    return response.toResponse();
+  }
+
+  if (pathname === '/api/canary/api/v1/errors') {
+    // Tombstone: answered without reading or forwarding the request body.
+    const response = new NodeResponse();
+    await canaryTombstone(nodeRequest(request), response);
+    return response.toResponse();
+  }
+
+  if (pathname === '/api' || pathname.startsWith('/api/')) {
+    return jsonResponse({ error: 'Not found' }, 404);
+  }
+
+  return new Response(null, { status: 404 });
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request) {
     try {
-      const { pathname } = new URL(request.url);
-      if (pathname === '/api' || pathname.startsWith('/api/')) {
-        return await handleApiRequest(request);
-      }
-      return await env.ASSETS.fetch(request);
+      return await handle(request);
     } catch (error) {
       console.error(
         JSON.stringify({
           level: 'error',
           service: 'timeismoney-splash',
-          operation: 'request',
+          operation: 'worker.request',
           error: error instanceof Error ? error.message : 'unknown error',
         })
       );
-      return jsonError(500, { error: 'Internal server error' });
+      return jsonResponse({ error: 'Internal server error' }, 500);
     }
   },
 };

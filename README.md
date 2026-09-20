@@ -2,30 +2,35 @@
 
 Static landing page for the [Time is Money Chrome extension](https://chromewebstore.google.com/detail/time-is-money/ooppbnomdcjmoepangldchpmjhkeendl).
 
-## Quick Start
+## Development
 
-Open `index.html` in a browser, or serve locally:
+This is a static site. No build step required.
 
 ```bash
+# Open directly in browser
+open index.html
+
+# Or use any static server
 python3 -m http.server 8000
-```
+npx serve .
 
-Verify the Canary health and relay functions:
+# Liveness, retirement, and config contracts
+node scripts/verify-retirement.js
 
-```bash
-node scripts/verify-canary.js
-```
+# Browser bootstrap (vm sandbox; proves disabled is a no-op)
+node scripts/verify-browser.js
 
-Run the full local CI gate before shipping:
+# Verify Worker routing locally
+node scripts/verify-worker.js
 
-```bash
+# Run the full local CI gate
 node scripts/ci.js
-```
 
-After a production deploy, verify live Canary ingest and readback:
-
-```bash
-CANARY_READ_API_KEY=... node scripts/smoke-canary-production.js
+# Run the Worker locally (assets + api routes; needs wrangler 4.135+)
+# Tip: if dev reload-loops, add `--persist-to /tmp/wrangler-state`; the
+# local state churn under .wrangler/ can trip the file watcher when the
+# assets directory is the repo root.
+wrangler dev --env staging
 ```
 
 ## Structure
@@ -33,16 +38,21 @@ CANARY_READ_API_KEY=... node scripts/smoke-canary-production.js
 ```
 ├── index.html      # Single-page HTML
 ├── css/styles.css  # Vanilla CSS
-├── js/app.js       # Vanilla JavaScript
-├── js/canary.js    # Browser error observer
-├── scripts/verify-canary.js # Local Canary route verification
-├── scripts/ci.js # Local CI gate used by GitHub Actions
-├── scripts/verify-worker.js # Cloudflare Worker adapter verification
-├── scripts/smoke-canary-production.js # Production Canary smoke/readback
+├── js/
+│   ├── app.js      # Vanilla JavaScript
+│   └── sentry.js   # Browser Sentry bootstrap (config-injected, no-op when disabled)
+├── api/
+│   ├── health.js               # Liveness endpoint (sidecar + Worker)
+│   ├── sentry-config.js        # Injectable browser-monitoring config
+│   └── canary/api/v1/errors.js # 410 tombstone for the retired relay
+├── scripts/
+│   ├── ci.js                # Local CI gate used by GitHub Actions
+│   ├── verify-retirement.js # Liveness + tombstone + config contract checks
+│   ├── verify-browser.js    # vm-sandbox check of js/sentry.js
+│   ├── verify-server.js     # DigitalOcean sidecar adapter verification
+│   └── verify-worker.js     # Cloudflare Worker adapter verification
 ├── worker.mjs      # Cloudflare Worker entrypoint (API routes + assets)
 ├── server.js       # DigitalOcean sidecar adapter (soak/rollback origin)
-├── api/health.js   # Health endpoint handler
-├── api/canary/api/v1/errors.js # Browser error relay to Canary
 ├── fonts/          # Clash Display font
 └── images/         # Extension icon
 ```
@@ -53,43 +63,48 @@ CANARY_READ_API_KEY=... node scripts/smoke-canary-production.js
 - Time thieves calculator with toggle
 - Responsive design (mobile-first)
 - Zero dependencies, zero build step
-- Canary error reporting and production health checks via the app-owned relay
 
-## Deploy
+## Observability
 
 Production runs on Cloudflare Workers. One Worker serves the static site and
 the API contract: `worker.mjs` routes `/api/*` to the same handlers as the
-DigitalOcean sidecar (`api/health.js`, `api/canary/api/v1/errors.js`) and
-serves every other path from the static assets (`wrangler.jsonc` +
-`.assetsignore`). Deploy with `wrangler deploy --env staging` first, then
-`wrangler deploy --env production`; production attaches the custom domains
-(`timeismoney.mistystep.io`, `timeismoney.works`, `www.timeismoney.works`).
-The registrar nameserver flip is separate and operator-gated: until it
-completes, `timeismoney.works` and `www.timeismoney.works` keep serving from
-the DigitalOcean Caddy origin and redirect to `timeismoney.mistystep.io`.
+DigitalOcean sidecar (`server.js`), so the contract holds on both runtimes:
 
-The Worker defines:
+- `GET|HEAD /api/health` — site liveness only. HTTP 200 is never proof of
+  error delivery.
+- `GET|HEAD /api/sentry-config` — browser-monitoring config, injectable at
+  deploy time.
+- `any method /api/canary/api/v1/errors` — HTTP 410 tombstone. The old
+  Canary relay is retired; the route never reads, stores, or forwards a
+  request body.
 
-- `CANARY_API_KEY` - service-bound ingest key for `timeismoney-splash`
-  (set as a Worker secret, never committed)
-- `CANARY_ENDPOINT` - defaults to `https://canary.mistystep.io`
-- `CANARY_SERVICE_NAME` - defaults to `timeismoney-splash`
-- `NEXT_PUBLIC_SITE_URL` - extra allowed browser origin for the relay
-  (`https://timeismoney.mistystep.io` in production, the workers.dev origin in
-  staging). `https://www.timeismoney.works` and `https://timeismoney.works`
-  are always allowed.
+Browser error collection is intentionally unavailable until a Sentry DSN is
+provided at deploy time. The page loads the official `@sentry/browser`
+bundle (pinned version) only when the config endpoint reports
+`enabled: true`; errors then travel from the SDK straight to Sentry ingest.
+The app owns no relay and stores nothing.
 
-`/api/health` is a liveness/config check and returns `503` if Canary is not
-configured. Use `scripts/smoke-canary-production.js` after deploy to prove
-end-to-end Canary ingest.
+Both runtimes read the same environment names:
 
-Note: the Canary product is retired (Estate ADR 0003) and
-`canary.mistystep.io` no longer exists. Until a replacement sink is
-configured, `/api/health` reports `canary: not_configured` (`503` in
-production) and the relay answers `503 Canary is not configured`. The
-endpoints stay live so the custom-domain cutover does not regress; point
-`CANARY_ENDPOINT` and `CANARY_API_KEY` at a live sink to re-enable
-forwarding.
+- `SENTRY_DSN` — public client-side DSN for the site's Sentry project.
+  Unset means monitoring is off; no DSN is committed to this repository.
+- `SENTRY_ENVIRONMENT` — `staging` or `production`
+- `SENTRY_RELEASE` — optional release identifier
+- `NODE_ENV` — fallback environment name
+
+## Deploy
+
+Production runs on Cloudflare Workers (`wrangler deploy --env staging`
+first, then `wrangler deploy --env production`; production attaches the
+custom domains `timeismoney.mistystep.io`, `timeismoney.works`, and
+`www.timeismoney.works`). The registrar nameserver flip is separate and
+operator-gated: until it completes, `timeismoney.works` and
+`www.timeismoney.works` keep serving from the DigitalOcean Caddy origin and
+redirect to `timeismoney.mistystep.io`.
 
 The DigitalOcean origin (`server.js` + Caddy on public-apps) remains the
 soak/rollback path until the Cloudflare cutover is finished.
+
+## Links
+
+- **Chrome Web Store:** [Install Time is Money](https://chromewebstore.google.com/detail/time-is-money/ooppbnomdcjmoepangldchpmjhkeendl)
