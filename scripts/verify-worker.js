@@ -1,42 +1,23 @@
 #!/usr/bin/env node
 'use strict';
 
+// Verifies the Cloudflare Worker entrypoint (worker.mjs) preserves the
+// sidecar routing contract for /api/health, /api/sentry-config, and the
+// retired /api/canary/api/v1/errors tombstone, and that non-API paths keep
+// 404ing like the assets-only deployment.
+//
+// Usage: node scripts/verify-worker.js
+
 const assert = require('node:assert/strict');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 
 const ROOT = path.resolve(__dirname, '..');
+const SITE = 'https://www.timeismoney.works';
+const TOMBSTONE_PATH = '/api/canary/api/v1/errors';
 
-function assetEnv() {
-  const requested = [];
-  return {
-    requested,
-    env: {
-      ASSETS: {
-        fetch: async (request) => {
-          requested.push(new URL(request.url).pathname);
-          return new Response('<!doctype html><title>asset</title>', {
-            status: 200,
-            headers: { 'Content-Type': 'text/html; charset=utf-8' },
-          });
-        },
-      },
-    },
-  };
-}
-
-function relayRequest(host, origin, body, extraHeaders = {}) {
-  return new Request(`https://${host}/api/canary/api/v1/errors`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Host: host,
-      Origin: origin,
-      Referer: `${origin}/`,
-      ...extraHeaders,
-    },
-    body: JSON.stringify(body),
-  });
+function makeRequest(pathname, options = {}) {
+  return new Request(`${SITE}${pathname}`, options);
 }
 
 async function main() {
@@ -44,281 +25,133 @@ async function main() {
     await import(pathToFileURL(path.join(ROOT, 'worker.mjs')).href)
   ).default;
 
-  process.env.CANARY_API_KEY = 'test-key';
-  process.env.CANARY_SERVICE_NAME = 'timeismoney-splash';
-  process.env.CANARY_ENDPOINT = 'https://canary.example.test';
-  process.env.NEXT_PUBLIC_SITE_URL = 'https://timeismoney.mistystep.io';
   process.env.NODE_ENV = 'production';
+  delete process.env.SENTRY_DSN;
+  delete process.env.SENTRY_ENVIRONMENT;
+  delete process.env.SENTRY_RELEASE;
 
-  const { env, requested } = assetEnv();
+  // --- GET|HEAD /api/health ------------------------------------------------
+  let response = await worker.fetch(makeRequest('/api/health'));
+  assert.equal(response.status, 200, 'liveness must not fail closed');
+  assert.equal(
+    response.headers.get('Cache-Control'),
+    'no-cache, no-store, must-revalidate'
+  );
+  let body = await response.json();
+  assert.equal(body.status, 'ok');
+  assert.equal(body.service, 'timeismoney-splash');
+  assert.equal(body.checks.liveness, 'ok');
+  assert.equal(body.observability.canary.status, 'retired');
+  assert.equal(JSON.stringify(body).includes('dependencies'), false);
 
-  let forwarded;
-  const realFetch = global.fetch;
-  global.fetch = async (url, init) => {
-    forwarded = { url: String(url), init, body: JSON.parse(init.body) };
-    return new Response('{}', { status: 202 });
-  };
+  response = await worker.fetch(makeRequest('/api/health', { method: 'HEAD' }));
+  assert.equal(response.status, 200);
+  assert.equal(await response.text(), '');
 
-  try {
-    // --- /api/health: GET / HEAD / 405 ---
-    let response = await worker.fetch(
-      new Request('https://www.timeismoney.works/api/health'),
-      env
-    );
-    assert.equal(response.status, 200);
-    let body = await response.json();
-    assert.equal(body.dependencies.canary, 'configured');
-    assert.equal(body.observability.canary.status, 'configured');
+  response = await worker.fetch(makeRequest('/api/health', { method: 'POST' }));
+  assert.equal(response.status, 405);
+  assert.equal(response.headers.get('Allow'), 'GET, HEAD');
 
-    response = await worker.fetch(
-      new Request('https://www.timeismoney.works/api/health', {
-        method: 'HEAD',
-      }),
-      env
-    );
-    assert.equal(response.status, 200);
-    assert.equal(await response.text(), '');
+  // --- GET|HEAD /api/sentry-config ----------------------------------------
+  response = await worker.fetch(makeRequest('/api/sentry-config'));
+  assert.equal(response.status, 200);
+  body = await response.json();
+  assert.equal(body.enabled, false);
+  assert.equal('dsn' in body, false, 'no placeholder DSN may exist');
+  assert.equal(body.environment, 'production');
 
-    response = await worker.fetch(
-      new Request('https://www.timeismoney.works/api/health', {
-        method: 'POST',
-      }),
-      env
-    );
-    assert.equal(response.status, 405);
+  response = await worker.fetch(
+    makeRequest('/api/sentry-config', { method: 'HEAD' })
+  );
+  assert.equal(response.status, 200);
+  assert.equal(await response.text(), '');
 
-    delete process.env.CANARY_API_KEY;
-    response = await worker.fetch(
-      new Request('https://www.timeismoney.works/api/health'),
-      env
-    );
-    assert.equal(response.status, 503);
-    assert.equal(
-      (await response.json()).observability.canary.status,
-      'not_configured'
-    );
-    process.env.CANARY_API_KEY = 'test-key';
+  response = await worker.fetch(
+    makeRequest('/api/sentry-config', { method: 'POST' })
+  );
+  assert.equal(response.status, 405);
+  assert.equal(response.headers.get('Allow'), 'GET, HEAD');
 
-    // --- relay: accepted, redacted, forwarded with the bearer key ---
-    response = await worker.fetch(
-      relayRequest('www.timeismoney.works', 'https://www.timeismoney.works', {
-        message:
-          'user test@example.com failed with Bearer abc123 and token=secret',
-        error_class: 'WorkerSmokeTest',
-        severity: 'info',
-        stack_trace: 'fetch https://example.com/path?token=secret#frag',
-        context: {
-          authorization: 'Bearer abc123',
-          nested: { email: 'admin@example.com', dsn: 'sntryu_abc123456' },
-        },
-        fingerprint: ['timeismoney', 'token=secret'],
-      }),
-      env
-    );
-    assert.equal(response.status, 202);
-    assert.equal((await response.json()).status, 'accepted');
-    assert.equal(forwarded.url, 'https://canary.example.test/api/v1/errors');
-    assert.equal(forwarded.init.headers.Authorization, 'Bearer test-key');
-    assert.equal(forwarded.body.service, 'timeismoney-splash');
-    assert.equal(forwarded.body.message.includes('test@example.com'), false);
-    assert.equal(forwarded.body.message.includes('Bearer abc123'), false);
-    assert.equal(forwarded.body.stack_trace.includes('?token='), false);
-    assert.equal(forwarded.body.context.authorization, '[redacted]');
-    assert.equal(forwarded.body.context.nested.email, '[EMAIL_REDACTED]');
-    assert.equal(forwarded.body.context.nested.dsn, '[redacted]');
-    assert.equal(forwarded.body.fingerprint[1], 'token=[REDACTED]');
+  process.env.SENTRY_DSN = 'https://public@example.invalid/1';
+  process.env.SENTRY_ENVIRONMENT = 'staging';
+  response = await worker.fetch(makeRequest('/api/sentry-config'));
+  body = await response.json();
+  assert.equal(body.enabled, true);
+  assert.equal(body.dsn, 'https://public@example.invalid/1');
+  assert.equal(body.environment, 'staging');
+  delete process.env.SENTRY_DSN;
+  delete process.env.SENTRY_ENVIRONMENT;
 
-    // --- relay: the mistystep.io custom domain is an allowed same-origin host ---
-    response = await worker.fetch(
-      relayRequest(
-        'timeismoney.mistystep.io',
-        'https://timeismoney.mistystep.io',
-        { message: 'mistystep soak host' }
-      ),
-      env
-    );
-    assert.equal(response.status, 202);
-
-    // --- relay: rejections (bad origin, spoofed hosts, wrong method) ---
-    response = await worker.fetch(
-      relayRequest('www.timeismoney.works', 'https://evil.example', {
-        message: 'blocked origin',
-      }),
-      env
-    );
-    assert.equal(response.status, 403);
-
-    response = await worker.fetch(
-      relayRequest('evil.example', 'https://www.timeismoney.works', {
-        message: 'blocked host spoof',
-      }),
-      env
-    );
-    assert.equal(response.status, 403);
-
-    response = await worker.fetch(
-      relayRequest('evil.example', 'https://www.timeismoney.works', {
-        message: 'blocked forwarded host spoof',
-      }, { 'X-Forwarded-Host': 'www.timeismoney.works' }),
-      env
-    );
-    assert.equal(response.status, 403);
-
-    response = await worker.fetch(
-      new Request('https://www.timeismoney.works/api/canary/api/v1/errors'),
-      env
-    );
-    assert.equal(response.status, 405);
-
-    // --- relay: the local rate limiter still bounds a single client ---
-    for (let attempt = 1; attempt <= 31; attempt += 1) {
-      response = await worker.fetch(
-        relayRequest(
-          'www.timeismoney.works',
-          'https://www.timeismoney.works',
-          { message: `rate limit ${attempt}` },
-          { 'X-Forwarded-For': '198.51.100.77' }
-        ),
-        env
-      );
-      assert.equal(response.status, attempt <= 30 ? 202 : 429);
-    }
-
-    // --- relay: oversized bodies are rejected while streaming (no full buffer) ---
-    forwarded = undefined;
-    response = await worker.fetch(
-      relayRequest('www.timeismoney.works', 'https://www.timeismoney.works', {
-        message: 'x'.repeat(40000),
-      }),
-      env
-    );
-    assert.equal(response.status, 413);
-    assert.equal(forwarded, undefined);
-
-    const streamed = new ReadableStream({
-      start(controller) {
-        const encoder = new TextEncoder();
-        controller.enqueue(encoder.encode('{"message":"' + 'a'.repeat(20000)));
-        controller.enqueue(encoder.encode('b'.repeat(20000) + '"}'));
-        controller.close();
-      },
+  // --- /api/canary/api/v1/errors tombstone ---------------------------------
+  for (const method of ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS']) {
+    response = await worker.fetch(makeRequest(TOMBSTONE_PATH, { method }));
+    assert.equal(response.status, 410, `${method} must be a tombstone`);
+    assert.equal(response.headers.get('Cache-Control'), 'no-store');
+    assert.equal(response.headers.get('Access-Control-Allow-Origin'), null);
+    assert.deepEqual(await response.json(), {
+      status: 'retired',
+      service: 'canary',
     });
-    response = await worker.fetch(
-      new Request('https://www.timeismoney.works/api/canary/api/v1/errors', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Host: 'www.timeismoney.works',
-          Origin: 'https://www.timeismoney.works',
-        },
-        body: streamed,
-        duplex: 'half',
-      }),
-      env
-    );
-    assert.equal(response.status, 413);
-    assert.equal(forwarded, undefined);
-
-    // --- relay: a spoofed do-connecting-ip cannot rotate the rate-limit key ---
-    for (let attempt = 1; attempt <= 31; attempt += 1) {
-      response = await worker.fetch(
-        relayRequest(
-          'www.timeismoney.works',
-          'https://www.timeismoney.works',
-          { message: `spoofed client ip ${attempt}` },
-          {
-            'CF-Connecting-IP': '203.0.113.9',
-            'DO-Connecting-IP': `198.51.100.${attempt}`,
-          }
-        ),
-        env
-      );
-      assert.equal(response.status, attempt <= 30 ? 202 : 429);
-    }
-
-    // --- relay: the streaming cap counts raw bytes, not UTF-16 code units ---
-    forwarded = undefined;
-    const cjkStream = new ReadableStream({
-      start(controller) {
-        controller.enqueue(
-          new TextEncoder().encode('{"message":"' + '中'.repeat(15000) + '"}')
-        );
-        controller.close();
-      },
-    });
-    response = await worker.fetch(
-      new Request('https://www.timeismoney.works/api/canary/api/v1/errors', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Host: 'www.timeismoney.works',
-          Origin: 'https://www.timeismoney.works',
-        },
-        body: cjkStream,
-        duplex: 'half',
-      }),
-      env
-    );
-    assert.equal(response.status, 413);
-    assert.equal(forwarded, undefined);
-
-    // --- relay: a multibyte character split across chunks survives intact ---
-    forwarded = undefined;
-    const encoder = new TextEncoder();
-    const prefix = encoder.encode('{"message":"ok ');
-    const bomb = encoder.encode('💥');
-    const suffix = encoder.encode(' done"}');
-    const firstHalf = new Uint8Array(prefix.length + 2);
-    firstHalf.set(prefix);
-    firstHalf.set(bomb.slice(0, 2), prefix.length);
-    const secondHalf = new Uint8Array(bomb.length - 2 + suffix.length);
-    secondHalf.set(bomb.slice(2));
-    secondHalf.set(suffix, bomb.length - 2);
-    const splitStream = new ReadableStream({
-      start(controller) {
-        controller.enqueue(firstHalf);
-        controller.enqueue(secondHalf);
-        controller.close();
-      },
-    });
-    response = await worker.fetch(
-      new Request('https://www.timeismoney.works/api/canary/api/v1/errors', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Host: 'www.timeismoney.works',
-          Origin: 'https://www.timeismoney.works',
-        },
-        body: splitStream,
-        duplex: 'half',
-      }),
-      env
-    );
-    assert.equal(response.status, 202);
-    assert.equal(forwarded.body.message.includes('💥'), true);
-    assert.equal(forwarded.body.message.includes('\uFFFD'), false);
-
-    // --- unknown /api paths are worker-owned 404s, never asset lookups ---
-    response = await worker.fetch(
-      new Request('https://www.timeismoney.works/api/does-not-exist'),
-      env
-    );
-    assert.equal(response.status, 404);
-    assert.deepEqual(requested, []);
-
-    // --- non-api paths fall through to static assets ---
-    response = await worker.fetch(
-      new Request('https://www.timeismoney.works/'),
-      env
-    );
-    assert.equal(response.status, 200);
-    assert.equal(await response.text(), '<!doctype html><title>asset</title>');
-    assert.deepEqual(requested, ['/']);
-  } finally {
-    global.fetch = realFetch;
   }
 
-  console.log('timeismoney Worker adapter verification passed');
+  response = await worker.fetch(makeRequest(TOMBSTONE_PATH, { method: 'HEAD' }));
+  assert.equal(response.status, 410);
+  assert.equal(await response.text(), '');
+
+  // The tombstone must not read a request body at all: a pull-counted stream
+  // must record zero pulls.
+  let pulls = 0;
+  response = await worker.fetch(
+    new Request(`${SITE}${TOMBSTONE_PATH}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: new ReadableStream(
+        {
+          pull(controller) {
+            pulls += 1;
+            controller.enqueue(new Uint8Array(4096));
+          },
+        },
+        { highWaterMark: 0 }
+      ),
+      duplex: 'half',
+    })
+  );
+  assert.equal(response.status, 410);
+  assert.equal(pulls, 0, 'tombstone bodies must not be read');
+
+  // No forwarding can exist: a poisoned global fetch must never be called.
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = () => {
+    throw new Error('worker must not call fetch for the tombstone');
+  };
+  response = await worker.fetch(
+    makeRequest(TOMBSTONE_PATH, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: 'must not forward' }),
+    })
+  );
+  assert.equal(response.status, 410);
+  globalThis.fetch = originalFetch;
+
+  // --- Non-API fallthrough -------------------------------------------------
+  response = await worker.fetch(makeRequest('/api/unknown'));
+  assert.equal(response.status, 404);
+  assert.equal((await response.json()).error, 'Not found');
+  response = await worker.fetch(makeRequest('/api'));
+  assert.equal(response.status, 404);
+  response = await worker.fetch(makeRequest('/api/canary'));
+  assert.equal(response.status, 404);
+  assert.equal((await response.json()).error, 'Not found');
+
+  for (const pathname of ['/server.js', '/missing', '/worker.mjs']) {
+    response = await worker.fetch(makeRequest(pathname));
+    assert.equal(response.status, 404, `${pathname} must 404`);
+    assert.equal(await response.text(), '', `${pathname} must not leak a body`);
+  }
+
+  console.log('timeismoney Worker verification passed');
 }
 
 main().catch((error) => {

@@ -122,7 +122,7 @@ pre-commit:
 **File**: `js/canary.js`, `api/health.js`, `api/canary/api/v1/errors.js`
 **Perspectives**: architecture-guardian
 **Why**: Production errors and uptime should be visible through Canary, without adding a framework or package manager.
-**Status**: Implemented on Cloudflare Workers (`worker.mjs`) and the DigitalOcean sidecar (`server.js`) from the same handlers. Keep the service-bound `CANARY_API_KEY` server-only.
+**Status**: Retired. The relay is a 410 tombstone (`api/canary/api/v1/errors.js`) that never reads or forwards bodies; browser error tracking now uses the official Sentry browser SDK enabled by a deploy-provided `SENTRY_DSN` via `/api/sentry-config` (see README).
 
 ### [INFRASTRUCTURE] Add platform rate limiting for Canary relay
 **File**: DigitalOcean app settings or edge/firewall config
@@ -130,6 +130,7 @@ pre-commit:
 **Why**: The in-process relay limiter is useful as a local guardrail but is not durable production abuse control for unauthenticated browser telemetry.
 **Approach**: Configure an edge rate limit for `/api/canary/api/v1/errors`; keep browser-origin telemetry unauthenticated but bounded before it reaches the sidecar. The local guard keys first on DigitalOcean App Platform's `do-connecting-ip` header, so any future ingress change must preserve or deliberately replace that trust boundary.
 **Effort**: 1h | **Impact**: Prevents relay spam from burning Canary ingest capacity.
+**Status**: Moot; the relay is retired (410 tombstone) and owns no ingest capacity.
 
 ### [ACCESSIBILITY] Add ARIA Attributes to Interactive Elements
 **File**: app/page.tsx:90-110, 208-218

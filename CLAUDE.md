@@ -1,82 +1,67 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Static splash page for the Time is Money Chrome extension - converts prices to hours of work.
 
-## Project Overview
+## Project
 
-Time is Money landing page - A static HTML/CSS/JS marketing site for a Chrome extension that converts prices to hours of work. Zero build step, zero dependencies.
+- **Type:** Static HTML/CSS/JS (no build step)
+- **Theme:** Retro Americana (red, blue, cream, gold)
+- **Fonts:** Clash Display (local WOFF2), Geist (Google Fonts)
+
+## Structure
+
+```
+├── index.html      # All sections
+├── css/styles.css  # Theme + animations
+├── js/app.js       # Interactivity (carousel, calculator)
+├── js/sentry.js    # Browser Sentry bootstrap (config-injected, no-op when disabled)
+├── api/health.js   # Liveness endpoint (sidecar + Worker)
+├── api/sentry-config.js # Injectable browser-monitoring config
+├── api/canary/api/v1/errors.js # 410 tombstone for the retired relay
+├── worker.mjs      # Cloudflare Worker entry (assets + api routes)
+├── server.js       # DigitalOcean sidecar adapter (soak/rollback origin)
+├── scripts/ci.js   # Local CI gate used by GitHub Actions
+├── scripts/verify-retirement.js # Liveness + tombstone + config contract checks
+├── scripts/verify-browser.js    # vm-sandbox check of js/sentry.js
+├── scripts/verify-server.js     # DigitalOcean sidecar adapter verification
+├── scripts/verify-worker.js     # Worker route verification
+└── favicon.ico
+```
 
 ## Development
 
 ```bash
-# Serve locally (any static server works)
-python3 -m http.server 8000
-# or
-npx serve .
-
 # Open in browser
 open index.html
 
-# Verify Canary health and relay behavior
-node scripts/verify-canary.js
+# Or any static server
+python3 -m http.server 8000
+
+# Contract checks
+node scripts/verify-retirement.js
+node scripts/verify-browser.js
+
+# Verify Worker routing locally
+node scripts/verify-worker.js
 
 # Run the full local CI gate
 node scripts/ci.js
 
-# Verify deployed Canary ingest and readback
-CANARY_READ_API_KEY=... node scripts/smoke-canary-production.js
+# Run the Worker locally (assets + api routes)
+wrangler dev --env staging
 ```
 
-## Architecture
+## URLs
 
-### Tech Stack
-- **HTML**: Single `index.html` file
-- **CSS**: Vanilla CSS with custom properties (`css/styles.css`)
-- **JavaScript**: Vanilla JS, no framework (`js/app.js`)
-- **Fonts**: Clash Display (local WOFF2), Geist (Google Fonts CDN)
+- Chrome Store: https://chromewebstore.google.com/detail/time-is-money/ooppbnomdcjmoepangldchpmjhkeendl
+- Production: https://timeismoney.mistystep.io (custom domains attach at the registrar flip)
+- Staging: https://timeismoney-splash-staging.misty-step.workers.dev
 
-### Project Structure
-```
-├── index.html          # Single-page HTML
-├── css/
-│   └── styles.css      # All styles (~400 lines)
-├── js/
-│   └── app.js          # All interactivity (~200 lines)
-├── scripts/
-│   ├── verify-canary.js # Canary route verification
-│   ├── ci.js            # Local CI gate used by GitHub Actions
-│   ├── verify-worker.js # Cloudflare Worker adapter verification
-│   └── smoke-canary-production.js # Production Canary smoke/readback
-├── worker.mjs          # Cloudflare Worker entrypoint (API routes + assets)
-├── server.js           # DigitalOcean sidecar adapter (soak/rollback origin)
-├── api/
-│   ├── health.js       # Health endpoint handler
-│   └── canary/api/v1/errors.js  # Browser error relay to Canary
-├── fonts/
-│   └── ClashDisplay-Variable.woff2
-├── images/
-│   └── icon_640.png
-└── favicon.ico
-```
+## Observability notes
 
-### Key Features
-- **Demo Card Carousel**: Auto-rotates every 3.5s, pauses on hover, keyboard navigation (arrow keys)
-- **Time Thieves Calculator**: Monthly/yearly toggle with animated counter
-- **Chrome Install Buttons**: Loading state with spinner, opens Chrome Web Store
-
-### Styling Approach
-- CSS custom properties for colors, shadows, spacing
-- Mobile-first responsive design (768px, 1024px breakpoints)
-- No preprocessor, no build step
-
-### External Integration
-- Chrome Web Store: `https://chromewebstore.google.com/detail/time-is-money/ooppbnomdcjmoepangldchpmjhkeendl?hl=en`
-- Google Fonts CDN for Geist font
-- Canary: `/api/health` and `/api/canary/api/v1/errors` are served by the Cloudflare Worker (`worker.mjs`) and the DigitalOcean sidecar (`server.js`) from the same handlers; keep `CANARY_API_KEY` server-only.
-
-### File Sizes
-- `index.html`: ~20KB
-- `css/styles.css`: ~28KB
-- `js/app.js`: ~12KB
-- `fonts/`: ~32KB
-- **Total**: ~100KB (vs 546MB with Next.js)
+- `GET /api/health` is liveness only; it never proves error delivery.
+- The retired legacy relay answers 410 for every method and never reads or
+  forwards request bodies. Kept until a separate removal decision.
+- Browser error collection runs through the official Sentry browser SDK and
+  is enabled by a deploy-provided `SENTRY_DSN` (see README). Never commit a
+  DSN and never invent one.
