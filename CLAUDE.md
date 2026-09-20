@@ -45,9 +45,12 @@ CANARY_READ_API_KEY=... node scripts/smoke-canary-production.js
 ├── scripts/
 │   ├── verify-canary.js # Canary route verification
 │   ├── ci.js            # Local CI gate used by GitHub Actions
+│   ├── verify-worker.js # Cloudflare Worker adapter verification
 │   └── smoke-canary-production.js # Production Canary smoke/readback
+├── worker.mjs          # Cloudflare Worker entrypoint (API routes + assets)
+├── server.js           # DigitalOcean sidecar adapter (soak/rollback origin)
 ├── api/
-│   ├── health.js       # DigitalOcean sidecar health endpoint
+│   ├── health.js       # Health endpoint handler
 │   └── canary/api/v1/errors.js  # Browser error relay to Canary
 ├── fonts/
 │   └── ClashDisplay-Variable.woff2
@@ -69,7 +72,7 @@ CANARY_READ_API_KEY=... node scripts/smoke-canary-production.js
 ### External Integration
 - Chrome Web Store: `https://chromewebstore.google.com/detail/time-is-money/ooppbnomdcjmoepangldchpmjhkeendl?hl=en`
 - Google Fonts CDN for Geist font
-- Canary: `/api/health` and `/api/canary/api/v1/errors` on the DigitalOcean sidecar; keep `CANARY_API_KEY` server-only.
+- Canary: `/api/health` and `/api/canary/api/v1/errors` are served by the Cloudflare Worker (`worker.mjs`) and the DigitalOcean sidecar (`server.js`) from the same handlers; keep `CANARY_API_KEY` server-only.
 
 ### File Sizes
 - `index.html`: ~20KB

@@ -2,27 +2,49 @@
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "timeismoney-splash",
   "account_id": "b069014f6a46558ea9146fb6c4ff8f6c",
+  "main": "worker.mjs",
   "compatibility_date": "2026-09-19",
+  "compatibility_flags": ["nodejs_compat"],
   "workers_dev": false,
   "preview_urls": false,
   "assets": {
     "directory": "./",
-    "not_found_handling": "none"
+    "binding": "ASSETS",
+    "not_found_handling": "none",
+    "run_worker_first": ["/api/*"]
   },
   "env": {
     "staging": {
       "name": "timeismoney-splash-staging",
-      "workers_dev": true
+      "workers_dev": true,
+      "vars": {
+        // The staging workers.dev origin must be allowed to relay browser
+        // errors same-origin; production allow-lists the custom domains plus
+        // the mistystep.io soak host (see api/canary/api/v1/errors.js).
+        "NEXT_PUBLIC_SITE_URL": "https://timeismoney-splash-staging.misty-step.workers.dev",
+        // Production semantics for /api/health: 503 when Canary is not
+        // configured (matches the documented sidecar contract).
+        "NODE_ENV": "production"
+      }
     },
     "production": {
       "name": "timeismoney-splash",
       "workers_dev": false,
+      "vars": {
+        "NEXT_PUBLIC_SITE_URL": "https://timeismoney.mistystep.io",
+        "NODE_ENV": "production"
+      },
       "routes": [
         // Attaches timeismoney.mistystep.io as a Worker custom domain on
         // deploy; Cloudflare manages the proxied DNS record (copy: cantrip/site,
         // vibe-machine/site). The former DNS-only A on public-apps must not
         // exist when this attaches; on error 100117 delete that record first.
-        { "pattern": "timeismoney.mistystep.io", "custom_domain": true }
+        { "pattern": "timeismoney.mistystep.io", "custom_domain": true },
+        // timeismoney.works + www.timeismoney.works are attached to the same
+        // worker; the timeismoney.works zone is pending activation (registrar
+        // NS flip pending, operator-gated).
+        { "pattern": "timeismoney.works", "custom_domain": true },
+        { "pattern": "www.timeismoney.works", "custom_domain": true }
       ]
     }
   }

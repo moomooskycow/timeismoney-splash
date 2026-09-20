@@ -122,7 +122,7 @@ pre-commit:
 **File**: `js/canary.js`, `api/health.js`, `api/canary/api/v1/errors.js`
 **Perspectives**: architecture-guardian
 **Why**: Production errors and uptime should be visible through Canary, without adding a framework or package manager.
-**Status**: Implemented in the DigitalOcean static app plus sidecar. Keep the service-bound `CANARY_API_KEY` server-only.
+**Status**: Implemented on Cloudflare Workers (`worker.mjs`) and the DigitalOcean sidecar (`server.js`) from the same handlers. Keep the service-bound `CANARY_API_KEY` server-only.
 
 ### [INFRASTRUCTURE] Add platform rate limiting for Canary relay
 **File**: DigitalOcean app settings or edge/firewall config

@@ -375,3 +375,7 @@ module.exports = async function handler(req, res) {
 
   res.status(202).json({ status: 'accepted' });
 };
+
+// The Cloudflare Worker adapter enforces the same byte cap while reading
+// request streams; keep the limit shared to prevent drift.
+module.exports.MAX_BODY_BYTES = MAX_BODY_BYTES;
